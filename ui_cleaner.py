@@ -1,10 +1,13 @@
+from bk_tree import BKTree
 import customtkinter as ctk
 import sqlite3
 import os
 import math
 from PIL import Image
 from typing import List, Tuple, Dict, Optional
+from model import ImageData
 from dataclasses import dataclass
+from tqdm import tqdm
 
 # --- CONFIGURATION ---
 DB_NAME = "images.db"
@@ -12,15 +15,6 @@ DEFAULT_THRESHOLD = 15
 ITEMS_PER_PAGE = 50 
 
 # --- DATA MODELS ---
-@dataclass
-class ImageData:
-    id: int
-    path: str
-    phash: int
-    width: int
-    height: int
-    file_size: int
-    capture_date: str
 
 @dataclass
 class DuplicateGroup:
@@ -65,29 +59,39 @@ def find_duplicate_groups(images: List[ImageData], threshold: int) -> List[Dupli
     groups = []
     processed_ids = set()
 
-    # Optimization: Sort by ID or Path doesn't help much with O(N^2), 
-    # but printing status helps UX.
-    print(f"Recalculating with Threshold {threshold}...")
+    print(f"Construindo índice BK-Tree para {len(images)} imagens...")
     
-    for i in range(len(images)):
-        img_a = images[i]
-        if img_a.id in processed_ids:
+    # 1. Constrói a árvore (Rápido: O(N log N))
+    tree = BKTree()
+
+    for img in tqdm(images, desc="Construindo Árvore"):
+        tree.add(img)
+
+    print(f"Buscando duplicatas...")
+    
+    # 2. Busca Agrupada
+    # Ainda iteramos sobre as imagens, mas a busca interna é ultra-rápida
+    for img in tqdm(images, desc="Buscando Duplicatas"):
+        if img.id in processed_ids:
             continue
 
-        current_duplicates = []
-        for j in range(i + 1, len(images)):
-            img_b = images[j]
-            if img_b.id in processed_ids:
-                continue
-
-            # Calculate Hamming Distance
-            if (img_a.phash ^ img_b.phash).bit_count() <= threshold:
-                current_duplicates.append(img_b)
-                processed_ids.add(img_b.id)
+        # Busca na árvore apenas o que está próximo
+        # Isso retorna TODOS os vizinhos (incluindo ela mesma)
+        potential_duplicates = tree.search(img, threshold)
         
+        # Filtra os resultados
+        current_duplicates = []
+        for match in potential_duplicates:
+            if match.id == img.id: continue # Pula ela mesma
+            if match.id in processed_ids: continue # Já foi agrupada
+
+            current_duplicates.append(match)
+            processed_ids.add(match.id)
+        
+        # Se achou duplicatas, cria o grupo
         if current_duplicates:
-            groups.append(DuplicateGroup(original=img_a, duplicates=current_duplicates))
-            processed_ids.add(img_a.id)
+            groups.append(DuplicateGroup(original=img, duplicates=current_duplicates))
+            processed_ids.add(img.id)
 
     groups.sort(key=lambda x: x.total_count, reverse=True)
     return groups
