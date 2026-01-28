@@ -9,7 +9,8 @@ from typing import Optional, Generator, Tuple, List
 
 # --- TYPE ALIASES ---
 # Represents the file path and its corresponding 64-bit integer hash
-HashResult = Tuple[str, int]
+# (path, phash, width, height, file_size, capture_date) 
+HashResult = Tuple[str, int, int, int, int, str]
 
 def setup_database(db_name: str = "images.db") -> sqlite3.Connection:
     """
@@ -24,12 +25,40 @@ def setup_database(db_name: str = "images.db") -> sqlite3.Connection:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT UNIQUE,  -- Unique constraint prevents duplicate files
-            phash INTEGER      -- Stored as 64-bit signed integer
+            path TEXT UNIQUE,
+            phash INTEGER,
+            width INTEGER,
+            height INTEGER,
+            file_size INTEGER,
+            capture_date TEXT
         )
     """)
     conn.commit()
     return conn
+
+def get_capture_date(img: Image.Image, file_path: str) -> str:
+    """
+    Tries to extract the EXIF DateTimeOriginal. 
+    Falls back to File System modification time if EXIF is missing.
+    """
+    date_str = None
+    
+    # 1. Try EXIF Data
+    try:
+        exif = img.getexif()
+        if exif:
+            # 36867 = DateTimeOriginal
+            # 306 = DateTime
+            date_str = exif.get(36867) or exif.get(306)
+    except Exception:
+        pass
+
+    # 2. Fallback to File System (os.path.getmtime)
+    if not date_str:
+        timestamp = os.path.getmtime(file_path)
+        date_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    
+    return str(date_str)
 
 def compute_phash(file_path: str) -> Optional[HashResult]:
     """
@@ -38,17 +67,14 @@ def compute_phash(file_path: str) -> Optional[HashResult]:
     try:
         with Image.open(file_path) as img:
             image_hash = imagehash.phash(img)
-            
-            # Convert hex to Python's arbitrary precision integer
             val = int(str(image_hash), 16)
-            
-            # FIX: Convert to Signed 64-bit Integer (Two's Complement)
-            # SQLite INTEGER supports up to 2^63 - 1. 
-            # If val is larger (unsigned 64-bit), we map it to the negative range.
             if val >= 2**63:
                 val -= 2**64
-                
-            return file_path, val
+            
+            width, height = img.size
+            file_size = os.path.getsize(file_path)
+            capture_date = get_capture_date(img, file_path)
+            return file_path, val, width, height, file_size, capture_date
     except Exception:
         return None
 
@@ -100,7 +126,7 @@ def main() -> None:
         results = executor.map(compute_phash, image_stream)
         
         # tqdm consumes the iterator yielded by executor.map
-        for result in tqdm(results, unit="img"):
+        for result in tqdm(results, unit=" img"):
             if result is None:
                 continue
 
@@ -111,7 +137,7 @@ def main() -> None:
                 try:
                     # INSERT OR IGNORE: Skips the row if 'path' already exists
                     cursor.executemany(
-                        "INSERT OR IGNORE INTO images (path, phash) VALUES (?, ?)", 
+                        "INSERT OR IGNORE INTO images (path, phash, width, height, file_size, capture_date) VALUES (?, ?, ?, ?, ?, ?)", 
                         buffer
                     )
                     conn.commit()
@@ -121,7 +147,7 @@ def main() -> None:
 
     # --- FINAL FLUSH ---
     if buffer:
-        cursor.executemany("INSERT OR IGNORE INTO images (path, phash) VALUES (?, ?)", buffer)
+        cursor.executemany("INSERT OR IGNORE INTO images (path, phash , width, height, file_size, capture_date) VALUES (?, ?, ?, ?, ?, ?)", buffer)
         conn.commit()
 
     print("\n[*] Indexing complete.")

@@ -8,8 +8,8 @@ from dataclasses import dataclass
 
 # --- CONFIGURATION ---
 DB_NAME = "images.db"
-THRESHOLD = 5
-ITEMS_PER_PAGE = 50  # Performance limit (Pagination)
+DEFAULT_THRESHOLD = 15
+ITEMS_PER_PAGE = 50 
 
 # --- DATA MODELS ---
 @dataclass
@@ -17,6 +17,10 @@ class ImageData:
     id: int
     path: str
     phash: int
+    width: int
+    height: int
+    file_size: int
+    capture_date: str
 
 @dataclass
 class DuplicateGroup:
@@ -35,15 +39,14 @@ class DuplicateGroup:
 class DatabaseHandler:
     def __init__(self, db_name: str):
         self.conn = sqlite3.connect(db_name)
-        # WAL mode improves concurrency
         self.conn.execute("PRAGMA journal_mode=WAL;") 
 
     def get_all_images(self) -> List[ImageData]:
         cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT id, path, phash FROM images")
+            cursor.execute("SELECT id, path, phash, width, height, file_size, capture_date FROM images")
             rows = cursor.fetchall()
-            return [ImageData(id=r[0], path=r[1], phash=r[2]) for r in rows]
+            return [ImageData(id=r[0], path=r[1], phash=r[2], width=r[3], height=r[4], file_size=r[5], capture_date=r[6]) for r in rows]
         except sqlite3.OperationalError:
             return []
 
@@ -62,7 +65,9 @@ def find_duplicate_groups(images: List[ImageData], threshold: int) -> List[Dupli
     groups = []
     processed_ids = set()
 
-    print(f"Processing math for {len(images)} images...")
+    # Optimization: Sort by ID or Path doesn't help much with O(N^2), 
+    # but printing status helps UX.
+    print(f"Recalculating with Threshold {threshold}...")
     
     for i in range(len(images)):
         img_a = images[i]
@@ -92,15 +97,17 @@ class CleanerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Duplicate Photo Cleaner (Optimized)")
-        self.geometry("1000x800")
+        self.title("Duplicate Photo Cleaner (Adjustable Sensitivity)")
+        self.geometry("1100x850")
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
-        # Pagination State
+        # App State
         self.current_page = 0
         self.total_pages = 0
-        self.image_cache = {} # Prevents reloading images from disk constantly
+        self.current_threshold = DEFAULT_THRESHOLD
+        self.image_cache = {} 
+        self.all_images_cache = [] # Holds all raw data from DB
 
         # Initialization
         if not os.path.exists(DB_NAME):
@@ -108,71 +115,100 @@ class CleanerApp(ctk.CTk):
             return
 
         self.db = DatabaseHandler(DB_NAME)
-        all_images = self.db.get_all_images()
+        self.all_images_cache = self.db.get_all_images()
         
-        # Initial grouping calculation
-        self.groups = find_duplicate_groups(all_images, THRESHOLD)
+        # Initial calculation
+        self.recalculate_groups()
 
         if not self.groups:
-            self.show_error("No duplicates found. Your library is clean.")
-            return
+            self.show_error("No duplicates found initially. Try increasing sensitivity.")
+            # Even if empty, we show the UI so user can adjust slider
+            self.show_main_list_view()
+        else:
+            self.show_main_list_view()
 
-        # Calculate pages
+    def recalculate_groups(self):
+        """Runs the grouping algorithm with current threshold."""
+        self.groups = find_duplicate_groups(self.all_images_cache, int(self.current_threshold))
+        self.current_page = 0 # Reset to first page
         self.total_pages = math.ceil(len(self.groups) / ITEMS_PER_PAGE)
-        self.show_main_list_view()
 
     def show_error(self, message: str):
+        # We only use this for fatal errors, not for empty results anymore (since we have a slider)
         lbl = ctk.CTkLabel(self, text=message, text_color="red", font=("Arial", 20))
         lbl.pack(expand=True)
 
     def get_cached_thumbnail(self, path: str, size: Tuple[int, int]) -> Optional[ctk.CTkImage]:
-        """Loads image with caching mechanism to avoid UI freeze."""
         cache_key = f"{path}_{size}"
-        
         if cache_key in self.image_cache:
             return self.image_cache[cache_key]
-
         try:
             pil_img = Image.open(path)
             ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=size)
-            
-            # Simple cache eviction policy if it gets too big
-            if len(self.image_cache) > 1000: 
-                self.image_cache.clear() 
-                
+            if len(self.image_cache) > 1000: self.image_cache.clear() 
             self.image_cache[cache_key] = ctk_img
             return ctk_img
         except Exception:
             return None
 
-    # --- MAIN VIEW (PAGINATED) ---
+    # --- MAIN VIEW ---
     def show_main_list_view(self):
         self.clear_window()
 
-        # Header
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=10)
+        # --- HEADER AREA (With Slider) ---
+        header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        header_frame.pack(fill="x", padx=20, pady=10)
         
-        ctk.CTkLabel(header, text=f"Duplicate Groups ({len(self.groups)} total)", font=("Arial", 20, "bold")).pack(side="left")
+        # Title Column
+        title_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        title_frame.pack(side="left")
+        ctk.CTkLabel(title_frame, text="Duplicate Groups", font=("Arial", 22, "bold")).pack(anchor="w")
+        ctk.CTkLabel(title_frame, text=f"Total: {len(self.groups)} groups", text_color="gray").pack(anchor="w")
+
+        # Slider Column (Center/Right)
+        slider_frame = ctk.CTkFrame(header_frame, fg_color="#2b2b2b", corner_radius=10)
+        slider_frame.pack(side="right", padx=20, pady=5)
         
+        ctk.CTkLabel(slider_frame, text="Similarity Threshold", font=("Arial", 12, "bold")).pack(pady=(5,0))
+        
+        self.lbl_threshold = ctk.CTkLabel(slider_frame, text=f"{int(self.current_threshold)}", font=("Arial", 20, "bold"), text_color="#3B8ED0")
+        self.lbl_threshold.pack()
+
+        slider = ctk.CTkSlider(
+            slider_frame, 
+            from_=3, 
+            to=20, 
+            number_of_steps=17, 
+            width=200,
+            command=self.on_slider_change
+        )
+        slider.set(self.current_threshold)
+        slider.pack(padx=15, pady=(0, 10))
+        
+        ctk.CTkLabel(slider_frame, text="(3=Strict, 20=Loose)", font=("Arial", 10), text_color="gray").pack(pady=(0,5))
+
+
+        # --- LIST CONTENT ---
         # Pagination Info
-        page_info = f"Page {self.current_page + 1} of {self.total_pages}"
-        ctk.CTkLabel(header, text=page_info, text_color="gray").pack(side="right")
+        page_info = f"Page {self.current_page + 1} of {max(1, self.total_pages)}"
+        ctk.CTkLabel(self, text=page_info, text_color="gray").pack(anchor="e", padx=20)
 
         # Scroll Area
         self.scroll_frame = ctk.CTkScrollableFrame(self)
         self.scroll_frame.pack(fill="both", expand=True, padx=20, pady=5)
 
-        # Slicing Logic for Pagination
-        start_index = self.current_page * ITEMS_PER_PAGE
-        end_index = start_index + ITEMS_PER_PAGE
-        current_batch = self.groups[start_index:end_index]
+        if not self.groups:
+            ctk.CTkLabel(self.scroll_frame, text="No duplicates found with this threshold.", font=("Arial", 16)).pack(pady=50)
+        else:
+            # Slicing Logic
+            start_index = self.current_page * ITEMS_PER_PAGE
+            end_index = start_index + ITEMS_PER_PAGE
+            current_batch = self.groups[start_index:end_index]
 
-        # Render only current batch
-        for group in current_batch:
-            self.create_group_card(group)
+            for group in current_batch:
+                self.create_group_card(group)
 
-        # Footer with Navigation
+        # --- FOOTER ---
         footer = ctk.CTkFrame(self, height=50, fg_color="transparent")
         footer.pack(fill="x", padx=20, pady=10)
 
@@ -181,6 +217,22 @@ class CleanerApp(ctk.CTk):
 
         btn_next = ctk.CTkButton(footer, text="Next >", state="normal" if self.current_page < self.total_pages - 1 else "disabled", command=self.next_page)
         btn_next.pack(side="right")
+
+    def on_slider_change(self, value):
+        """Callback for slider. Updates label and refreshes list on release."""
+        new_val = int(value)
+        self.lbl_threshold.configure(text=f"{new_val}")
+        
+        # Only recalculate if value actually changed (discrete steps)
+        if new_val != self.current_threshold:
+            self.current_threshold = new_val
+            # In a real heavy app, we would debounce this, but for 5000 images it's fast enough
+            self.recalculate_groups()
+            
+            # Refresh view (We call it slightly delayed or directly)
+            # Here we just refresh the whole view to show new results
+            self.after(100, self.show_main_list_view)
+
 
     def next_page(self):
         if self.current_page < self.total_pages - 1:
@@ -196,7 +248,6 @@ class CleanerApp(ctk.CTk):
         card = ctk.CTkFrame(self.scroll_frame)
         card.pack(fill="x", pady=5)
 
-        # Thumbnail
         thumb = self.get_cached_thumbnail(group.original.path, (80, 80))
         if thumb:
             ctk.CTkLabel(card, text="", image=thumb).pack(side="left", padx=10, pady=10)
@@ -213,13 +264,11 @@ class CleanerApp(ctk.CTk):
     def show_detail_view(self, group: DuplicateGroup):
         self.clear_window()
         
-        # Top Bar
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", padx=20, pady=10)
         ctk.CTkButton(top, text="← Back", width=60, command=self.show_main_list_view).pack(side="left")
         ctk.CTkLabel(top, text="Select to Delete", font=("Arial", 18, "bold")).pack(side="left", padx=20)
 
-        # Scroll Grid
         self.grid_frame = ctk.CTkScrollableFrame(self)
         self.grid_frame.pack(fill="both", expand=True, padx=20, pady=10)
         
@@ -233,26 +282,24 @@ class CleanerApp(ctk.CTk):
             frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
             self.grid_frame.grid_columnconfigure(col, weight=1)
 
-            # Clickable Thumbnail
-            thumb = self.get_cached_thumbnail(img_data.path, (150, 150))
+            thumb = self.get_cached_thumbnail(img_data.path, (250, 250))
             if thumb:
                 lbl = ctk.CTkLabel(frame, text="", image=thumb, cursor="hand2")
                 lbl.pack(pady=5)
                 lbl.bind("<Button-1>", lambda e, p=img_data.path: self.open_zoom(p))
 
-            # Explicit Zoom Button
             ctk.CTkButton(frame, text="🔍 Zoom", height=20, fg_color="#444", command=lambda p=img_data.path: self.open_zoom(p)).pack()
-            
-            # Delete Checkbox
+            ctk.CTkLabel(frame, text=f"{img_data.path}", font=("Arial", 12)).pack()
+            ctk.CTkLabel(frame, text=f"{img_data.width} x {img_data.height}", font=("Arial", 12)).pack()
+            ctk.CTkLabel(frame, text=f"{img_data.file_size  / 1024 / 1024:.2f} MB", font=("Arial", 12)).pack()
+            ctk.CTkLabel(frame, text=f"{img_data.capture_date}", font=("Arial", 12)).pack()
             chk = ctk.CTkCheckBox(frame, text="Delete", fg_color="red")
             chk.pack(pady=5)
             self.checkboxes[chk] = img_data
 
-        # Bottom Action Bar
         btn_del = ctk.CTkButton(self, text="Delete Selected", fg_color="red", command=lambda: self.delete_selected(group))
         btn_del.pack(pady=10)
 
-    # --- ZOOM MODAL ---
     def open_zoom(self, path: str):
         try:
             top = ctk.CTkToplevel(self)
@@ -262,13 +309,9 @@ class CleanerApp(ctk.CTk):
             top.focus()
             
             pil_img = Image.open(path)
-            
-            # Simple logic to fit image within a reasonable window size
             base_width = 800
             w_percent = (base_width / float(pil_img.size[0]))
             h_size = int((float(pil_img.size[1]) * float(w_percent)))
-            
-            # If height is too tall, scale by height instead
             if h_size > 600:
                 h_size = 600
                 w_percent = (h_size / float(pil_img.size[1]))
@@ -276,7 +319,6 @@ class CleanerApp(ctk.CTk):
 
             img = ctk.CTkImage(pil_img, size=(base_width, h_size))
             ctk.CTkLabel(top, text="", image=img).pack(expand=True)
-            
         except Exception as e:
             print(f"Error opening zoom: {e}")
 
@@ -286,15 +328,16 @@ class CleanerApp(ctk.CTk):
 
         for img in to_del:
             self.db.delete_image(img)
-            # Update in-memory objects
+            # Removing from cache list as well to keep counts consistent
+            if img in self.all_images_cache:
+                self.all_images_cache.remove(img)
+            
             if img in group.duplicates: group.duplicates.remove(img)
             if img == group.original and group.duplicates: group.original = group.duplicates.pop(0)
-            elif img == group.original: pass # Last item case
+            elif img == group.original: pass 
 
-        # Logic to decide where to go next
         if group.total_count <= 1:
             if group in self.groups: self.groups.remove(group)
-            # Recalculate pages
             self.total_pages = math.ceil(len(self.groups) / ITEMS_PER_PAGE)
             self.show_main_list_view()
         else:
